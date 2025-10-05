@@ -1,74 +1,65 @@
-from __future__ import annotations
+# app/routers/library.py
+from fastapi import APIRouter, Header, HTTPException
+import os, requests
+from uuid import UUID
 
-import uuid
-import httpx
-from fastapi import APIRouter, HTTPException, Header
-from loguru import logger
+router = APIRouter(prefix="/library", tags=["library"])
 
-from ..settings import settings
-from ..auth import user_id_from_auth_header
+SUPABASE_URL = os.environ["SUPABASE_URL"]            # e.g. https://xxxx.supabase.co
+SERVICE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]  # server-only service role
+SR_HEADERS = {"apikey": SERVICE_KEY, "Authorization": f"Bearer {SERVICE_KEY}"}
 
-router = APIRouter()
+def get_user_id_from_token(authorization: str | None) -> str | None:
+  if not authorization or not authorization.lower().startswith("bearer "):
+    return None
+  token = authorization.split(" ", 1)[1]
+  r = requests.get(f"{SUPABASE_URL}/auth/v1/user",
+                   headers={"Authorization": f"Bearer {token}", "apikey": SERVICE_KEY})
+  if r.status_code != 200:
+    return None
+  return r.json().get("id")
 
-SB_REST = f"{settings.SUPABASE_URL}/rest/v1"
-SB_HEADERS = {
-    "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
-    "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}",
-    "Content-Type": "application/json",
-}
+def ensure_owner(table: str, row_id: str, user_id: str):
+  r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}?id=eq.{row_id}&select=id,user_id", headers=SR_HEADERS)
+  if r.status_code != 200 or not r.json():
+    raise HTTPException(status_code=404, detail="Not found")
+  row = r.json()[0]
+  if row.get("user_id") != user_id:
+    raise HTTPException(status_code=403, detail="Not your row")
 
-def _as_uuid(val: str) -> uuid.UUID:
-    try:
-        return uuid.UUID(str(val))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid UUID")
+@router.delete("/document/{doc_id}")
+def delete_document(doc_id: str, authorization: str | None = Header(default=None)):
+  try:
+    UUID(doc_id)
+  except Exception:
+    raise HTTPException(status_code=400, detail="Invalid document id")
+  user_id = get_user_id_from_token(authorization)
+  if not user_id:
+    raise HTTPException(status_code=401, detail="Unauthorized")
 
-async def _owner_check(table: str, row_id: str, uid: str) -> None:
-    """Ensure the row belongs to uid (using service role but verifying manually)."""
-    params = {"id": f"eq.{row_id}", "select": "id,user_id", "limit": "1"}
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(f"{SB_REST}/{table}", headers=SB_HEADERS, params=params)
-    if r.status_code >= 300:
-        raise HTTPException(status_code=500, detail=f"Supabase read failed: {r.text}")
-    rows = r.json()
-    if not rows:
-        raise HTTPException(status_code=404, detail="Not found")
-    if rows[0].get("user_id") != uid:
-        raise HTTPException(status_code=403, detail="Forbidden")
+  ensure_owner("documents", doc_id, user_id)
 
-@router.delete("/library/documents/{doc_id}")
-async def delete_document(doc_id: str, Authorization: str | None = Header(default=None)):
-    uid = user_id_from_auth_header(Authorization)
-    if not uid:
-        raise HTTPException(status_code=401, detail="Missing/invalid token")
+  # If you DO NOT have FK cascade, delete child quizzes first (harmless if none).
+  requests.delete(f"{SUPABASE_URL}/rest/v1/quizzes?doc_id=eq.{doc_id}", headers=SR_HEADERS)
 
-    _ = _as_uuid(doc_id)  # validate format
-    await _owner_check("documents", doc_id, uid)
+  r = requests.delete(f"{SUPABASE_URL}/rest/v1/documents?id=eq.{doc_id}", headers=SR_HEADERS)
+  if r.status_code not in (200, 204):
+    raise HTTPException(status_code=400, detail=r.text)
+  return {"ok": True}
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        # delete quizzes first (if FK isn't ON DELETE CASCADE)
-        dq = await client.delete(f"{SB_REST}/quizzes", headers=SB_HEADERS, params={"doc_id": f"eq.{doc_id}"})
-        if dq.status_code >= 300:
-            logger.warning(f"[delete] quizzes cleanup failed: {dq.status_code} {dq.text}")
+@router.delete("/quiz/{quiz_id}")
+def delete_quiz(quiz_id: str, authorization: str | None = Header(default=None)):
+  try:
+    UUID(quiz_id)
+  except Exception:
+    raise HTTPException(status_code=400, detail="Invalid quiz id")
+  user_id = get_user_id_from_token(authorization)
+  if not user_id:
+    raise HTTPException(status_code=401, detail="Unauthorized")
 
-        dd = await client.delete(f"{SB_REST}/documents", headers=SB_HEADERS, params={"id": f"eq.{doc_id}"})
-        if dd.status_code >= 300:
-            raise HTTPException(status_code=500, detail=f"Delete document failed: {dd.text}")
+  ensure_owner("quizzes", quiz_id, user_id)
 
-    return {"deleted": True, "id": doc_id}
-
-@router.delete("/library/quizzes/{quiz_id}")
-async def delete_quiz(quiz_id: str, Authorization: str | None = Header(default=None)):
-    uid = user_id_from_auth_header(Authorization)
-    if not uid:
-        raise HTTPException(status_code=401, detail="Missing/invalid token")
-
-    _ = _as_uuid(quiz_id)  # validate format
-    await _owner_check("quizzes", quiz_id, uid)
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        dq = await client.delete(f"{SB_REST}/quizzes", headers=SB_HEADERS, params={"id": f"eq.{quiz_id}"})
-        if dq.status_code >= 300:
-            raise HTTPException(status_code=500, detail=f"Delete quiz failed: {dq.text}")
-
-    return {"deleted": True, "id": quiz_id}
+  r = requests.delete(f"{SUPABASE_URL}/rest/v1/quizzes?id=eq.{quiz_id}", headers=SR_HEADERS)
+  if r.status_code not in (200, 204):
+    raise HTTPException(status_code=400, detail=r.text)
+  return {"ok": True}
