@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     SUPABASE_SERVICE_ROLE_KEY: str | None = None
     SUPABASE_JWT_SECRET: str | None = None
 
+    # Supabase Storage
+    SUPABASE_STORAGE_BUCKET: str = "documents"
+    SUPABASE_SIGNED_URL_TTL_SECONDS: int = 600
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

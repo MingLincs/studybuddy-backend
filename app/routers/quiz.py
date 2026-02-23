@@ -8,8 +8,8 @@ from ..services.cache import sha256_bytes, read_quiz, save_quiz
 from ..services.pdf import build_bullets_from_pdf
 from ..services.llm import llm
 from ..services.parse import parse_quiz
-from ..services.auth import get_user_id_from_auth_header
-from ..services.db import insert_quiz
+from ..auth import user_id_from_auth_header
+from ..services.db import insert_quiz, upsert_document, upload_pdf_to_storage, find_document_id_by_hash, new_uuid
 from ..settings import settings
 
 router = APIRouter()
@@ -30,15 +30,18 @@ async def quiz(
     if len(raw) > settings.MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(413, f"PDF too large. Max {settings.MAX_UPLOAD_MB} MB.")
 
-    doc_id = sha256_bytes(raw)
-    cached = read_quiz(doc_id)
-    if cached: return cached
+    content_hash = sha256_bytes(raw)
+    cached = read_quiz(content_hash)
+    if cached:
+        payload = dict(cached)
+        payload["id"] = new_uuid()
+        return payload
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(raw); tmp_path = tmp.name
 
     try:
-        joined, _ = await build_bullets_from_pdf(tmp_path, doc_id)
+        joined, _ = await build_bullets_from_pdf(tmp_path, content_hash)
 
         sys = (
             "Return only valid JSON with no extra text. "
@@ -65,22 +68,38 @@ async def quiz(
             )
             quiz_obj = parse_quiz(repaired)
 
-        payload = {"id": doc_id, "title": title, "num_questions": len(quiz_obj["questions"]),
+        payload = {"id": new_uuid(), "title": title, "num_questions": len(quiz_obj["questions"]),
                    "quiz_json": json.dumps(quiz_obj, ensure_ascii=False)}
-        save_quiz(doc_id, payload)
+        save_quiz(content_hash, payload)
 
         # Save to Supabase if logged in
         try:
-            user_id = get_user_id_from_auth_header(request.headers.get("Authorization"))
-            logger.info(f"[quiz] Supabase user_id={user_id!r} doc_id={doc_id}")
+            user_id = user_id_from_auth_header(request.headers.get("Authorization"))
             if user_id:
+                # Ensure there is a Document row (and PDF in Storage) so quizzes can link to it.
+                doc_uuid = find_document_id_by_hash(user_id=user_id, content_hash=content_hash)
+                if not doc_uuid:
+                    doc_uuid = new_uuid()
+                    pdf_path = upload_pdf_to_storage(user_id=user_id, doc_id=doc_uuid, raw_pdf=raw, filename=file.filename)
+                    upsert_document(
+                        user_id=user_id,
+                        doc_id=doc_uuid,
+                        title=title,
+                        summary="",
+                        cards_json=json.dumps({"cards": []}, ensure_ascii=False),
+                        guide_json=None,
+                        pdf_path=pdf_path,
+                        content_hash=content_hash,
+                    )
                 insert_quiz(
-                    user_id=user_id, doc_id=doc_id, title=title,
-                    quiz_json=payload["quiz_json"], num_questions=payload["num_questions"]
+                    user_id=user_id,
+                    doc_id=doc_uuid,
+                    title=title,
+                    quiz_json=payload["quiz_json"],
+                    num_questions=payload["num_questions"],
                 )
-                logger.info(f"[quiz] insert_quiz ok for user_id={user_id}")
-        except HTTPException as e:
-            logger.warning(f"[quiz] auth error: {e.detail}")
+        except Exception as e:
+            logger.warning(f"[quiz] persist error: {e}")
 
         return payload
 
